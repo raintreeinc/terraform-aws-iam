@@ -1,0 +1,183 @@
+name: Sync fork with upstream (smart)
+
+on:
+    push:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ['self-hosted', 'EKS', 'rt-devops']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "arn:aws:iam::491085425965:role/role_rt_devops-github-actions-runner"
+          aws-region: us-east-1
+          role-chaining: true
+
+      - name: Detect upstream and default branches
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const r = await github.rest.repos.get({owner, repo});
+            core.setOutput('is_fork', String(r.data.fork));
+            core.setOutput('default_branch', r.data.default_branch);
+            if (!r.data.fork || !r.data.parent) {
+              core.info('Not a fork or no parent – nothing to sync.');
+              return;
+            }
+            core.setOutput('up_owner',  r.data.parent.owner.login);
+            core.setOutput('up_repo',   r.data.parent.name);
+            core.setOutput('up_branch', r.data.parent.default_branch);
+
+      - name: Stop if not a fork
+        if: ${{ steps.meta.outputs.is_fork != 'true' }}
+        run: echo "This repository is not a fork. Exiting."
+
+      - name: Add upstream and fetch
+        if: ${{ steps.meta.outputs.is_fork == 'true' }}
+        run: |
+          set -euo pipefail
+          UP_O=${{ steps.meta.outputs.up_owner }}
+          UP_R=${{ steps.meta.outputs.up_repo }}
+          UP_B=${{ steps.meta.outputs.up_branch }}
+          BR=${{ steps.meta.outputs.default_branch }}
+
+          git remote add upstream https://github.com/${UP_O}/${UP_R}.git
+          git fetch --no-tags --prune upstream ${UP_B}
+          git fetch --no-tags --prune origin ${BR}
+
+          # Calculate ahead/behind: left=origin/BR, right=upstream/UP_B
+          COUNTS=$(git rev-list --left-right --count origin/${BR}...upstream/${UP_B})
+          LEFT=$(echo "$COUNTS" | awk '{print $1}')   # commits only in fork
+          RIGHT=$(echo "$COUNTS" | awk '{print $2}')  # commits only in upstream
+          echo "Upstream ahead by $RIGHT commits; fork ahead by $LEFT commits."
+          echo "ahead_upstream=$RIGHT" >> $GITHUB_OUTPUT
+
+      - name: Nothing to do (already up to date)
+        if: ${{ steps.meta.outputs.is_fork == 'true' && steps.meta.outputs.up_owner != '' && steps.add_upstream.outputs.ahead_upstream == '0' }}
+        run: echo "Fork is up to date with upstream; exiting."
+        id: noop
+
+      - name: Create sync branch and fast-forward or rebase
+        id: sync_branch
+        if: ${{ steps.meta.outputs.is_fork == 'true' }}
+        run: |
+          set -euo pipefail
+          UP_O=${{ steps.meta.outputs.up_owner }}
+          UP_R=${{ steps.meta.outputs.up_repo }}
+          UP_B=${{ steps.meta.outputs.up_branch }}
+          BR=${{ steps.meta.outputs.default_branch }}
+
+          # re-compute ahead count (explicitly) and bail if zero
+          RIGHT=$(git rev-list --right-only --count origin/${BR}...upstream/${UP_B})
+          if [ "$RIGHT" = "0" ]; then
+            echo "No upstream changes; skipping."
+            echo "mode=none" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          SYNC="sync/upstream-$(date +%Y%m%d%H%M%S)"
+          echo "branch=$SYNC" >> $GITHUB_OUTPUT
+
+          # Start from current default branch tip
+          git checkout -B "$SYNC" origin/${BR}
+
+          # Try fast-forward only
+          if git merge --ff-only upstream/${UP_B}; then
+            echo "mode=branch" >> $GITHUB_OUTPUT
+            git push -u origin "$SYNC"
+            exit 0
+          fi
+
+          echo "Not fast-forward; trying rebase to preserve linear history..."
+          if git rebase upstream/${UP_B}; then
+            echo "mode=branch" >> $GITHUB_OUTPUT
+            git push -u origin "$SYNC"
+            exit 0
+          fi
+
+          echo "Rebase had conflicts – falling back to external-head PR."
+          git rebase --abort || true
+          echo "mode=external" >> $GITHUB_OUTPUT
+
+      - name: Skip PR (nothing changed)
+        if: ${{ steps.sync_branch.outputs.mode == 'none' }}
+        run: echo "No changes detected; no PR created."
+
+      - name: Avoid duplicate PRs (external-head)
+        id: check_dupe_external
+        if: ${{ steps.sync_branch.outputs.mode == 'external' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const upOwner  = `${{ steps.meta.outputs.up_owner }}`;
+            const upRepo   = `${{ steps.meta.outputs.up_repo }}`;
+            const upBranch = `${{ steps.meta.outputs.up_branch }}`;
+            const base     = `${{ steps.meta.outputs.default_branch }}`;
+            const prs = await github.paginate(github.rest.pulls.list, {owner, repo, state:'open', base});
+            const exists = prs.some(pr => pr.head && pr.head.repo && pr.head.repo.full_name === `${upOwner}/${upRepo}` && pr.head.ref === upBranch);
+            core.setOutput('exists', String(exists));
+
+      - name: Open PR
+        if: ${{ steps.sync_branch.outputs.mode == 'external' && steps.check_dupe_external.outputs.exists != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const upOwner  = `${{ steps.meta.outputs.up_owner }}`;
+            const upRepo   = `${{ steps.meta.outputs.up_repo }}`;
+            const upBranch = `${{ steps.meta.outputs.up_branch }}`;
+            const base     = `${{ steps.meta.outputs.default_branch }}`;
+            const title = `Sync from upstream/${upBranch}`;
+            const body  = [
+              `Automated sync from \`${upOwner}/${upRepo}@${upBranch}\`.`,
+              `If conflicts exist, resolve them in this PR.`,
+            ].join('\n');
+            const pr = await github.rest.pulls.create({
+              owner, repo, title, base,
+              head: `${upOwner}:${upBranch}`,
+              body
+            });
+            core.notice(`Created PR #${pr.data.number}`);
+
+      - name: Avoid duplicate PRs (branch mode)
+        id: check_dupe_branch
+        if: ${{ steps.sync_branch.outputs.mode == 'branch' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const base   = `${{ steps.meta.outputs.default_branch }}`;
+            const head   = `${{ github.repository_owner }}:${{ steps.sync_branch.outputs.branch }}`;
+            const prs = await github.paginate(github.rest.pulls.list, {owner, repo, state:'open', base});
+            const exists = prs.some(pr => pr.head && `${pr.head.repo.owner.login}:${pr.head.ref}` === head);
+            core.setOutput('exists', String(exists));
+
+      - name: Open PR (branch mode)
+        if: ${{ steps.sync_branch.outputs.mode == 'branch' && steps.check_dupe_branch.outputs.exists != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const base   = `${{ steps.meta.outputs.default_branch }}`;
+            const head   = `${{ steps.sync_branch.outputs.branch }}`;
+            const title  = `Sync with upstream (${base})`;
+            const body   = 'Automated upstream sync (FF or rebase to keep linear history).';
+            const pr = await github.rest.pulls.create({owner, repo, title, base, head, body});
+            core.notice(`Created PR #${pr.data.number}`);
